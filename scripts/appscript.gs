@@ -29,7 +29,7 @@
  *   _AppCache:      A=key B=jsonValue C=updatedAt
  */
 
-var SHEETS = {
+var TASKFLOW_SHEETS = {
   COLLECTORS: 'Collectors',
   TASK_LIST: 'TASK_LIST',
   CA_PLUS: 'CA_PLUS',
@@ -40,9 +40,22 @@ var SHEETS = {
   RS_TASK_REQ: 'RS_Task_Req',
   APP_CACHE: '_AppCache'
 };
+// Backward-compat alias for projects that still reference SHEETS in old helper snippets.
+var SHEETS = TASKFLOW_SHEETS;
+
+function assertSheetConfig_() {
+  var required = ['COLLECTORS', 'TASK_LIST', 'ASSIGNMENTS', 'RS_TASK_REQ', 'APP_CACHE'];
+  for (var i = 0; i < required.length; i++) {
+    var key = required[i];
+    if (!TASKFLOW_SHEETS[key]) {
+      throw new Error('Missing TASKFLOW_SHEETS key: ' + key + '. Check for duplicate globals or stale files in Apps Script.');
+    }
+  }
+}
 
 function doGet(e) {
   try {
+    assertSheetConfig_();
     var action = (e.parameter.action || '').trim();
     var period = (e.parameter.period || '').trim();
     var result;
@@ -70,6 +83,7 @@ function doGet(e) {
 
 function doPost(e) {
   try {
+    assertSheetConfig_();
     var body = JSON.parse(e.postData.contents);
     var result = handleSubmit(body);
     return jsonOut({ success: true, data: result, message: result.message || 'OK' });
@@ -86,6 +100,9 @@ function jsonOut(obj) {
 function getSS() { return SpreadsheetApp.getActiveSpreadsheet(); }
 
 function getSheet(name) {
+  if (!name) {
+    throw new Error('Sheet key resolved to undefined. Check for duplicate global vars in Apps Script files (especially SHEETS) and redeploy the latest code.');
+  }
   var sheet = getSS().getSheetByName(name);
   if (!sheet) throw new Error('Sheet not found: ' + name);
   return sheet;
@@ -119,6 +136,14 @@ function getWeekStartDate(refDate) {
 
 function safeStr(v) { return String(v == null ? '' : v).trim(); }
 function safeNum(v) { var n = Number(v); return isFinite(n) ? n : 0; }
+function safeHours(v) {
+  if (v instanceof Date) return 0;
+  var n = Number(v);
+  if (!isFinite(n)) return 0;
+  // Guard against accidental date serials/timestamps being treated as hours.
+  if (Math.abs(n) > 10000) return 0;
+  return n;
+}
 
 /** Normalize cell value to a Date (for comparison). Returns null if invalid. */
 function toDateSafe(cell) {
@@ -126,8 +151,15 @@ function toDateSafe(cell) {
   if (cell == null || cell === '') return null;
   var d;
   if (typeof cell === 'number') {
-    // Google Sheets serial date numbers are days since 1899-12-30.
-    d = cell > 10000000000 ? new Date(cell) : new Date((cell - 25569) * 86400 * 1000);
+    // Google Sheets serial dates are whole days since 1899-12-30 (timezone-less).
+    if (cell > 10000000000) {
+      d = new Date(cell);
+    } else {
+      var wholeDays = Math.floor(cell);
+      var utcMs = Date.UTC(1899, 11, 30) + (wholeDays * 86400000);
+      var utcDate = new Date(utcMs);
+      d = new Date(utcDate.getUTCFullYear(), utcDate.getUTCMonth(), utcDate.getUTCDate());
+    }
   } else {
     d = new Date(cell);
   }
@@ -142,12 +174,77 @@ function normalizeTaskKey(name) {
   return safeStr(name).toLowerCase().replace(/[_\s]+/g, ' ').trim();
 }
 
+function getCollectorRows() {
+  var data = getSheetData(TASKFLOW_SHEETS.COLLECTORS);
+  if (!data || data.length === 0) return [];
+
+  var header = data[0] || [];
+  var headerLower = [];
+  for (var h = 0; h < header.length; h++) headerLower.push(safeStr(header[h]).toLowerCase());
+  var hasHeader = false;
+  for (var hh = 0; hh < headerLower.length; hh++) {
+    var hv = headerLower[hh];
+    if (hv.indexOf('collector') >= 0 || hv.indexOf('rig') >= 0 || hv.indexOf('email') >= 0 || hv.indexOf('hour') >= 0) {
+      hasHeader = true;
+      break;
+    }
+  }
+
+  var idx = {
+    name: 0,
+    rigId: 1,
+    email: 2,
+    weeklyCap: 3,
+    active: 4,
+    hoursUploaded: 5,
+    rating: 6
+  };
+
+  if (hasHeader) {
+    for (var c = 0; c < headerLower.length; c++) {
+      var col = headerLower[c].replace(/\s+/g, ' ').trim();
+      if ((col.indexOf('collector') >= 0 && col.indexOf('name') >= 0) || col === 'name') idx.name = c;
+      if (col.indexOf('rig') >= 0) idx.rigId = c;
+      if (col.indexOf('email') >= 0) idx.email = c;
+      if (col.indexOf('weekly') >= 0 && (col.indexOf('cap') >= 0 || col.indexOf('hour') >= 0)) idx.weeklyCap = c;
+      if (col.indexOf('active') >= 0) idx.active = c;
+      if ((col.indexOf('upload') >= 0) && (col.indexOf('hour') >= 0 || col.indexOf('hrs') >= 0)) idx.hoursUploaded = c;
+      if (col.indexOf('rating') >= 0) idx.rating = c;
+    }
+  }
+
+  var start = hasHeader ? 1 : 0;
+  var out = [];
+  for (var i = start; i < data.length; i++) {
+    var row = data[i];
+    var name = safeStr(row[idx.name]);
+    if (!name) continue;
+
+    var activeRaw = safeStr(row[idx.active]).toLowerCase();
+    var active = true;
+    if (activeRaw) {
+      active = !(activeRaw === 'false' || activeRaw === '0' || activeRaw === 'no' || activeRaw === 'inactive');
+    }
+
+    out.push({
+      name: name,
+      rigId: safeStr(row[idx.rigId]),
+      email: safeStr(row[idx.email]),
+      weeklyCap: safeNum(row[idx.weeklyCap]),
+      active: active,
+      hoursUploaded: safeNum(row[idx.hoursUploaded]),
+      rating: safeStr(row[idx.rating])
+    });
+  }
+  return out;
+}
+
 function getCollectorRigMap() {
   var map = {};
-  var data = getSheetData(SHEETS.COLLECTORS);
-  for (var i = 1; i < data.length; i++) {
-    var cName = normalizeCollectorKey(data[i][0]);
-    var rig = safeStr(data[i][1]).toLowerCase();
+  var rows = getCollectorRows();
+  for (var i = 0; i < rows.length; i++) {
+    var cName = normalizeCollectorKey(rows[i].name);
+    var rig = safeStr(rows[i].rigId).toLowerCase();
     if (cName && rig) map[cName] = rig;
   }
   return map;
@@ -159,7 +256,7 @@ function getCollectorRigMap() {
  */
 function getCollectorActualRows() {
   var ss = getSS();
-  var sourceSheet = ss.getSheetByName(SHEETS.CA_PLUS) || ss.getSheetByName(SHEETS.CA_TAGGED);
+  var sourceSheet = ss.getSheetByName(TASKFLOW_SHEETS.CA_PLUS) || ss.getSheetByName(TASKFLOW_SHEETS.CA_TAGGED);
   if (!sourceSheet) return [];
 
   var rows = sourceSheet.getDataRange().getValues();
@@ -180,20 +277,34 @@ function getCollectorActualRows() {
 
   var idxDate = 0;
   var idxRig = 1;
-  var idxTask = (sheetName === SHEETS.CA_PLUS) ? 2 : 4;
-  var idxHours = (sheetName === SHEETS.CA_PLUS) ? 3 : 5;
-  var idxCollector = (sheetName === SHEETS.CA_PLUS) ? 4 : 3;
-  var idxSite = (sheetName === SHEETS.CA_PLUS) ? -1 : 2;
+  var idxTask = (sheetName === TASKFLOW_SHEETS.CA_PLUS) ? 2 : 4;
+  var idxHours = (sheetName === TASKFLOW_SHEETS.CA_PLUS) ? 3 : 5;
+  var idxCollector = (sheetName === TASKFLOW_SHEETS.CA_PLUS) ? 4 : 3;
+  var idxSite = (sheetName === TASKFLOW_SHEETS.CA_PLUS) ? -1 : 2;
 
   if (hasHeader) {
+    var preferredHoursIdx = -1;
+    var fallbackHoursIdx = -1;
     for (var c = 0; c < headerLower.length; c++) {
-      var col = headerLower[c];
+      var col = headerLower[c].replace(/\s+/g, ' ').trim();
       if (idxDate === 0 && (col === 'date' || col.indexOf('date') >= 0)) idxDate = c;
       if (col.indexOf('rig') >= 0 || col === 'rigid' || col === 'rig_id') idxRig = c;
-      if (col.indexOf('task') >= 0) idxTask = c;
-      if (col.indexOf('hour') >= 0 || col === 'hrs') idxHours = c;
+      if (col.indexOf('task') >= 0 && col.indexOf('id') < 0) idxTask = c;
       if (col.indexOf('collector') >= 0) idxCollector = c;
       if (col === 'site' || col === 'region') idxSite = c;
+
+      var looksLikeHours = (col.indexOf('hour') >= 0 || col.indexOf('hrs') >= 0);
+      var isMinutes = col.indexOf('minute') >= 0 || col.indexOf('min') >= 0;
+      var isDerived = col.indexOf('remaining') >= 0 || col.indexOf('good') >= 0 || col.indexOf('collected') >= 0;
+      if (looksLikeHours && !isMinutes && !isDerived) {
+        if (col.indexOf('upload') >= 0) preferredHoursIdx = c;
+        else if (fallbackHoursIdx === -1) fallbackHoursIdx = c;
+      }
+    }
+    if (preferredHoursIdx >= 0) idxHours = preferredHoursIdx;
+    else if (fallbackHoursIdx >= 0) idxHours = fallbackHoursIdx;
+    else if (sheetName === TASKFLOW_SHEETS.CA_PLUS && headerLower.length > 5) {
+      idxHours = 5; // Known CA_PLUS default: "Hours Uploaded"
     }
   }
 
@@ -247,36 +358,102 @@ function getLiveHoursForAssignment(liveIndex, rigId, taskName, sinceDate) {
 
 function buildTaskActualLookup() {
   var map = {};
-  var rows;
-  try { rows = getTaskActualsData(); } catch(e) { rows = []; }
-  for (var i = 1; i < rows.length; i++) {
-    var taskName = safeStr(rows[i][1]);
+  var rows = getTaskActualRows();
+  for (var i = 0; i < rows.length; i++) {
+    var taskName = rows[i].taskName;
     if (!taskName) continue;
     var key = normalizeTaskKey(taskName);
     map[key] = {
-      collectedHours: Math.round(safeNum(rows[i][2]) * 100) / 100,
-      goodHours: Math.round(safeNum(rows[i][3]) * 100) / 100,
-      remainingHours: Math.round(safeNum(rows[i][5]) * 100) / 100
+      collectedHours: Math.round(safeHours(rows[i].collectedHours) * 100) / 100,
+      goodHours: Math.round(safeHours(rows[i].goodHours) * 100) / 100,
+      remainingHours: Math.round(safeHours(rows[i].remainingHours) * 100) / 100
     };
   }
   return map;
 }
 
+function getTaskActualRows() {
+  var data;
+  try { data = getTaskActualsData(); } catch(e) { data = []; }
+  if (!data || data.length === 0) return [];
+
+  var header = data[0] || [];
+  var headerLower = [];
+  for (var h = 0; h < header.length; h++) headerLower.push(safeStr(header[h]).toLowerCase());
+  var hasHeader = false;
+  for (var hh = 0; hh < headerLower.length; hh++) {
+    var hv = headerLower[hh];
+    if (
+      hv.indexOf('task') >= 0 ||
+      hv.indexOf('collected') >= 0 ||
+      hv.indexOf('good') >= 0 ||
+      hv.indexOf('remaining') >= 0 ||
+      hv.indexOf('status') >= 0 ||
+      hv.indexOf('redash') >= 0
+    ) {
+      hasHeader = true;
+      break;
+    }
+  }
+
+  var idx = {
+    taskId: 0,
+    taskName: 1,
+    collectedHours: 2,
+    goodHours: 3,
+    status: 4,
+    remainingHours: 5,
+    lastRedash: 10
+  };
+
+  if (hasHeader) {
+    for (var c = 0; c < headerLower.length; c++) {
+      var col = headerLower[c].replace(/\s+/g, '');
+      if (col === 'taskid' || col === 'task_id' || col === 'id') idx.taskId = c;
+      if (col === 'task' || col === 'taskname' || (col.indexOf('task') >= 0 && col.indexOf('name') >= 0)) idx.taskName = c;
+      if (col.indexOf('collected') >= 0) idx.collectedHours = c;
+      if (col.indexOf('good') >= 0 && col.indexOf('hour') >= 0 || col === 'goodhrs' || col === 'good') idx.goodHours = c;
+      if (col.indexOf('status') >= 0) idx.status = c;
+      if (col.indexOf('remaining') >= 0) idx.remainingHours = c;
+      if (col.indexOf('redash') >= 0 || col.indexOf('lastupdate') >= 0 || col.indexOf('timestamp') >= 0) idx.lastRedash = c;
+    }
+  }
+
+  var start = hasHeader ? 1 : 0;
+  var rows = [];
+  for (var i = start; i < data.length; i++) {
+    var row = data[i];
+    if (!row) continue;
+    var taskName = safeStr(row[idx.taskName]);
+    if (!taskName) continue;
+    rows.push({
+      taskId: safeStr(row[idx.taskId]),
+      taskName: taskName,
+      collectedHours: Math.round(safeHours(row[idx.collectedHours]) * 100) / 100,
+      goodHours: Math.round(safeHours(row[idx.goodHours]) * 100) / 100,
+      status: safeStr(row[idx.status]),
+      remainingHours: Math.round(safeHours(row[idx.remainingHours]) * 100) / 100,
+      lastRedash: safeStr(row[idx.lastRedash])
+    });
+  }
+  return rows;
+}
+
 function handleGetCollectors() {
-  var data = getSheetData(SHEETS.COLLECTORS);
+  var data = getCollectorRows();
   var results = [];
-  for (var i = 1; i < data.length; i++) {
-    var name = safeStr(data[i][0]);
+  for (var i = 0; i < data.length; i++) {
+    var name = safeStr(data[i].name);
     if (!name) continue;
-    var rigId = safeStr(data[i][1]);
+    var rigId = safeStr(data[i].rigId);
     results.push({
       name: name,
       rigs: rigId ? [rigId] : [],
-      email: safeStr(data[i][2]),
-      weeklyCap: safeNum(data[i][3]),
-      active: safeStr(data[i][4]).toUpperCase() !== 'FALSE',
-      hoursUploaded: safeNum(data[i][5]),
-      rating: safeStr(data[i][6])
+      email: safeStr(data[i].email),
+      weeklyCap: safeNum(data[i].weeklyCap),
+      active: !!data[i].active,
+      hoursUploaded: safeNum(data[i].hoursUploaded),
+      rating: safeStr(data[i].rating)
     });
   }
   writeCache('collectors', results);
@@ -284,7 +461,7 @@ function handleGetCollectors() {
 }
 
 function handleGetTasks() {
-  var data = getSheetData(SHEETS.TASK_LIST);
+  var data = getSheetData(TASKFLOW_SHEETS.TASK_LIST);
   var results = [];
   for (var i = 1; i < data.length; i++) {
     var name = safeStr(data[i][0]).replace(/^[\u2705]\s*/, '').trim();
@@ -317,21 +494,19 @@ function getWeekRange(period) {
 function handleGetLeaderboard(period) {
   var useWeekly = (period === 'thisWeek' || period === 'lastWeek');
   var weekRange = useWeekly ? getWeekRange(period) : null;
-  var collectorsData = getSheetData(SHEETS.COLLECTORS);
+  var collectorsData = getCollectorRows();
   var rigToName = {};
-  var rigToRegion = {};
   var collectorMeta = {};
-  for (var i = 1; i < collectorsData.length; i++) {
-    var cName = safeStr(collectorsData[i][0]);
-    var cRig = safeStr(collectorsData[i][1]).toLowerCase();
-    var cHours = safeNum(collectorsData[i][5]);
+  for (var i = 0; i < collectorsData.length; i++) {
+    var cName = safeStr(collectorsData[i].name);
+    var cRig = safeStr(collectorsData[i].rigId).toLowerCase();
+    var cHours = safeNum(collectorsData[i].hoursUploaded);
     if (cName) {
       var region = 'MX';
       if (cRig && (cRig.indexOf('sf') >= 0 || cRig.indexOf('ego-sf') >= 0)) region = 'SF';
       collectorMeta[normalizeCollectorKey(cName)] = { name: cName, hoursUploaded: cHours, rig: cRig, region: region };
       if (cRig) {
         rigToName[cRig] = cName;
-        rigToRegion[cRig] = region;
       }
     }
   }
@@ -365,7 +540,7 @@ function handleGetLeaderboard(period) {
   }
 
   var assignData;
-  try { assignData = getSheetData(SHEETS.ASSIGNMENTS); } catch(e) { assignData = []; }
+  try { assignData = getSheetData(TASKFLOW_SHEETS.ASSIGNMENTS); } catch(e) { assignData = []; }
 
   var map = {};
   for (var a = 1; a < assignData.length; a++) {
@@ -448,18 +623,18 @@ function handleGetCollectorStats(collectorName) {
   if (!collectorName) throw new Error('Missing collector');
   var normName = normalizeCollectorKey(collectorName);
 
-  var collectorsData = getSheetData(SHEETS.COLLECTORS);
+  var collectorsData = getCollectorRows();
   var myRig = '', myHoursUploaded = 0;
-  for (var c = 1; c < collectorsData.length; c++) {
-    if (normalizeCollectorKey(collectorsData[c][0]) === normName) {
-      myRig = safeStr(collectorsData[c][1]).toLowerCase();
-      myHoursUploaded = safeNum(collectorsData[c][5]);
+  for (var c = 0; c < collectorsData.length; c++) {
+    if (normalizeCollectorKey(collectorsData[c].name) === normName) {
+      myRig = safeStr(collectorsData[c].rigId).toLowerCase();
+      myHoursUploaded = safeNum(collectorsData[c].hoursUploaded);
       break;
     }
   }
 
   var assignData;
-  try { assignData = getSheetData(SHEETS.ASSIGNMENTS); } catch(e) { assignData = []; }
+  try { assignData = getSheetData(TASKFLOW_SHEETS.ASSIGNMENTS); } catch(e) { assignData = []; }
 
   var totalAssigned = 0, totalCompleted = 0, totalCanceled = 0;
   var totalLoggedHours = 0, totalPlannedHours = 0;
@@ -533,7 +708,7 @@ function handleGetTodayLog(collectorName) {
   if (!collectorName) return [];
   var normName = normalizeCollectorKey(collectorName);
   var assignData;
-  try { assignData = getSheetData(SHEETS.ASSIGNMENTS); } catch(e) { return []; }
+  try { assignData = getSheetData(TASKFLOW_SHEETS.ASSIGNMENTS); } catch(e) { return []; }
   var collectorRigMap = getCollectorRigMap();
   var liveHoursIndex = buildLiveHoursIndex(getCollectorActualRows());
   var taskActualLookup = buildTaskActualLookup();
@@ -586,13 +761,12 @@ function handleGetTodayLog(collectorName) {
 }
 
 function handleGetRecollections() {
-  var data;
-  try { data = getTaskActualsData(); } catch(e) { return []; }
+  var data = getTaskActualRows();
   var results = [];
-  for (var i = 1; i < data.length; i++) {
-    var st = safeStr(data[i][4]).toLowerCase();
-    var tn = safeStr(data[i][1]);
-    var rem = safeNum(data[i][5]);
+  for (var i = 0; i < data.length; i++) {
+    var st = safeStr(data[i].status).toLowerCase();
+    var tn = safeStr(data[i].taskName);
+    var rem = safeHours(data[i].remainingHours);
     if (tn && (st === 'recollect' || st === 'needs recollection' || rem < 0)) {
       results.push(tn + (rem !== 0 ? ' (' + (Math.round(rem * 100) / 100).toFixed(2) + 'h)' : ''));
     }
@@ -603,7 +777,7 @@ function handleGetRecollections() {
 
 function handleGetFullLog(collectorFilter) {
   var data;
-  try { data = getSheetData(SHEETS.ASSIGNMENTS); } catch(e) { return []; }
+  try { data = getSheetData(TASKFLOW_SHEETS.ASSIGNMENTS); } catch(e) { return []; }
   var normFilter = collectorFilter ? normalizeCollectorKey(collectorFilter) : '';
   var collectorRigMap = getCollectorRigMap();
   var liveHoursIndex = buildLiveHoursIndex(getCollectorActualRows());
@@ -653,16 +827,15 @@ function handleGetFullLog(collectorFilter) {
 }
 
 function handleGetTaskActuals() {
-  var data;
-  try { data = getTaskActualsData(); } catch(e) { return []; }
+  var data = getTaskActualRows();
 
   // Build collector data from CA_PLUS (preferred) or CA_TAGGED (fallback)
   var actualRows = getCollectorActualRows();
   var rigToCollectorName = {};
-  var collectorsData = getSheetData(SHEETS.COLLECTORS);
-  for (var c = 1; c < collectorsData.length; c++) {
-    var rig = safeStr(collectorsData[c][1]).toLowerCase();
-    var name = safeStr(collectorsData[c][0]);
+  var collectorsData = getCollectorRows();
+  for (var c = 0; c < collectorsData.length; c++) {
+    var rig = safeStr(collectorsData[c].rigId).toLowerCase();
+    var name = safeStr(collectorsData[c].name);
     if (rig && name) rigToCollectorName[rig] = name;
   }
 
@@ -685,8 +858,8 @@ function handleGetTaskActuals() {
   }
 
   var results = [];
-  for (var i = 1; i < data.length; i++) {
-    var tn = safeStr(data[i][1]);
+  for (var i = 0; i < data.length; i++) {
+    var tn = safeStr(data[i].taskName);
     if (!tn) continue;
     var tnKey = normalizeTaskKey(tn);
     var tcData = taskCollectorMap[tnKey];
@@ -707,10 +880,12 @@ function handleGetTaskActuals() {
     }
 
     results.push({
-      taskId: safeStr(data[i][0]), taskName: tn,
-      collectedHours: Math.round(safeNum(data[i][2]) * 100) / 100, goodHours: Math.round(safeNum(data[i][3]) * 100) / 100,
-      status: safeStr(data[i][4]), remainingHours: Math.round(safeNum(data[i][5]) * 100) / 100,
-      lastRedash: safeStr(data[i][10]),
+      taskId: safeStr(data[i].taskId), taskName: tn,
+      collectedHours: Math.round(safeHours(data[i].collectedHours) * 100) / 100,
+      goodHours: Math.round(safeHours(data[i].goodHours) * 100) / 100,
+      status: safeStr(data[i].status),
+      remainingHours: Math.round(safeHours(data[i].remainingHours) * 100) / 100,
+      lastRedash: safeStr(data[i].lastRedash),
       assignedCollector: topCollector,
       collectorHours: Math.round(topHours * 100) / 100,
       collectorCount: collectorCount
@@ -721,13 +896,12 @@ function handleGetTaskActuals() {
 }
 
 function handleGetAdminDashboard() {
-  var taskData;
-  try { taskData = getTaskActualsData(); } catch(e) { taskData = []; }
+  var taskData = getTaskActualRows();
   var totalTasks = 0, completedTasks = 0, inProgressTasks = 0, recollectTasks = 0;
   var recollections = [];
-  for (var i = 1; i < taskData.length; i++) {
-    var st = safeStr(taskData[i][4]).toLowerCase();
-    var tn = safeStr(taskData[i][1]);
+  for (var i = 0; i < taskData.length; i++) {
+    var st = safeStr(taskData[i].status).toLowerCase();
+    var tn = safeStr(taskData[i].taskName);
     if (!tn) continue;
     totalTasks++;
     if (st === 'done' || st === 'completed' || st === 'complete') {
@@ -743,23 +917,23 @@ function handleGetAdminDashboard() {
     }
   }
 
-  var collectorsData = getSheetData(SHEETS.COLLECTORS);
+  var collectorsData = getCollectorRows();
   var totalCollectors = 0, totalHoursUploaded = 0;
   var collectorSummary = [];
-  for (var c = 1; c < collectorsData.length; c++) {
-    var nm = safeStr(collectorsData[c][0]);
+  for (var c = 0; c < collectorsData.length; c++) {
+    var nm = safeStr(collectorsData[c].name);
     if (!nm) continue;
     totalCollectors++;
-    var hrs = safeNum(collectorsData[c][5]);
+    var hrs = safeNum(collectorsData[c].hoursUploaded);
     totalHoursUploaded += hrs;
     collectorSummary.push({
-      name: nm, rig: safeStr(collectorsData[c][1]), email: safeStr(collectorsData[c][2]),
-      weeklyCap: safeNum(collectorsData[c][3]), hoursUploaded: hrs, rating: safeStr(collectorsData[c][6])
+      name: nm, rig: safeStr(collectorsData[c].rigId), email: safeStr(collectorsData[c].email),
+      weeklyCap: safeNum(collectorsData[c].weeklyCap), hoursUploaded: hrs, rating: safeStr(collectorsData[c].rating)
     });
   }
 
   var reqData;
-  try { reqData = getSheetData(SHEETS.RS_TASK_REQ); } catch(e) { reqData = []; }
+  try { reqData = getSheetData(TASKFLOW_SHEETS.RS_TASK_REQ); } catch(e) { reqData = []; }
   var taskReqs = [];
   for (var r = 1; r < reqData.length; r++) {
     var rn = safeStr(reqData[r][0]);
@@ -818,9 +992,9 @@ function handleGetAppCache() {
 
 function getOrCreateCacheSheet() {
   var ss = getSS();
-  var sheet = ss.getSheetByName(SHEETS.APP_CACHE);
+  var sheet = ss.getSheetByName(TASKFLOW_SHEETS.APP_CACHE);
   if (!sheet) {
-    sheet = ss.insertSheet(SHEETS.APP_CACHE);
+    sheet = ss.insertSheet(TASKFLOW_SHEETS.APP_CACHE);
     sheet.getRange(1, 1, 1, 3).setValues([['key', 'jsonValue', 'updatedAt']]);
   }
   return sheet;
@@ -903,7 +1077,7 @@ function handleSubmit(body) {
   if (!task) throw new Error('Missing task');
   if (!actionType) throw new Error('Missing actionType');
 
-  var sheet = getSheet(SHEETS.ASSIGNMENTS);
+  var sheet = getSheet(TASKFLOW_SHEETS.ASSIGNMENTS);
   var data = sheet.getDataRange().getValues();
 
   if (actionType === 'ASSIGN') {
